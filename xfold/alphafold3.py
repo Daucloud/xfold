@@ -197,19 +197,15 @@ class Evoformer(nn.Module):
 
         return pair_activations
 
-    def forward(
+    def compute_static_embeddings(
         self,
         batch: dict[str, torch.Tensor],
-        prev: dict[str, torch.Tensor],
         target_feat: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-
+        """Computes embeddings that are static across recycle steps."""
         pair_activations, pair_mask = self._seq_pair_embedding(
             batch.token_features, target_feat
         )
-
-        pair_activations += self.prev_embedding(
-            self.prev_embedding_layer_norm(prev['pair']))
 
         pair_activations = self._relative_encoding(batch, pair_activations)
 
@@ -229,6 +225,48 @@ class Evoformer(nn.Module):
             pair_mask=pair_mask,
             target_feat=target_feat,
         )
+        
+        return {
+            'pair_activations': pair_activations,
+            'pair_mask': pair_mask
+        }
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        prev: dict[str, torch.Tensor],
+        target_feat: torch.Tensor,
+        static_embeddings: dict[str, torch.Tensor] | None = None
+    ) -> dict[str, torch.Tensor]:
+
+        if static_embeddings is None:
+            # Fallback for when static embeddings are not precomputed
+            pair_activations, pair_mask = self._seq_pair_embedding(
+                batch.token_features, target_feat
+            )
+            pair_activations = self._relative_encoding(batch, pair_activations)
+            pair_activations = self._embed_bonds(
+                batch=batch, pair_activations=pair_activations
+            )
+            pair_activations = self._embed_template_pair(
+                batch=batch,
+                pair_activations=pair_activations,
+                pair_mask=pair_mask,
+            )
+            pair_activations = self._embed_process_msa(
+                msa_batch=batch.msa,
+                pair_activations=pair_activations,
+                pair_mask=pair_mask,
+                target_feat=target_feat,
+            )
+        else:
+            # Use precomputed static embeddings (clone to avoid in-place modification issues across recycles)
+            pair_activations = static_embeddings['pair_activations'].clone()
+            pair_mask = static_embeddings['pair_mask']
+
+        # Add previous pair embedding
+        pair_activations += self.prev_embedding(
+            self.prev_embedding_layer_norm(prev['pair']))
 
         single_activations = self.single_activations(target_feat)
         single_activations += self.prev_single_embedding(
@@ -372,11 +410,18 @@ class AlphaFold3(nn.Module):
             'target_feat': target_feat,  # type: ignore
         }
 
+        # Compute static embeddings once before the recycle loop
+        static_embeddings = self.evoformer.compute_static_embeddings(
+            batch=batch,
+            target_feat=target_feat
+        )
+
         for _ in range(self.num_recycles):
             embeddings = self.evoformer(
                 batch=batch,
                 prev=embeddings,
-                target_feat=target_feat
+                target_feat=target_feat,
+                static_embeddings=static_embeddings
             )
 
         samples = self._sample_diffusion(batch, embeddings)
