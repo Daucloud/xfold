@@ -167,12 +167,24 @@ class SelfAttention(nn.Module):
 
         x = self.adaptive_layernorm(x, single_cond)
 
-        q = self.q_projection(x)
-        k = self.k_projection(x)
-        v = self.v_projection(x)
+        # Fuse q/k/v projections into a single GEMM on x to reduce
+        # the number of large matrix multiplications.
+        n, c = x.shape
+        w_q = self.q_projection.weight  # [c, c]
+        w_k = self.k_projection.weight  # [c, c]
+        w_v = self.v_projection.weight  # [c, c]
+        w_qkv = torch.cat([w_q, w_k, w_v], dim=0)  # [3c, c]
 
-        q, k, v = map(lambda t: einops.rearrange(
-            t, 'n (h c) -> h n c', h=self.num_head).unsqueeze(0), [q, k, v])
+        qkv = torch.matmul(x, w_qkv.transpose(0, 1))  # [n, 3c]
+        q, k, v = qkv.split(c, dim=-1)
+
+        if self.q_projection.bias is not None:
+            q = q + self.q_projection.bias
+
+        # [n, c] -> [1, h, n, c//h]
+        q = q.view(n, self.num_head, self.qkv_dim).permute(1, 0, 2).unsqueeze(0).contiguous()
+        k = k.view(n, self.num_head, self.qkv_dim).permute(1, 0, 2).unsqueeze(0).contiguous()
+        v = v.view(n, self.num_head, self.qkv_dim).permute(1, 0, 2).unsqueeze(0).contiguous()
 
         weighted_avg = fastnn.dot_product_attention(
             q, k, v, mask=mask, bias=pair_logits
@@ -316,8 +328,20 @@ class CrossAttention(nn.Module):
         x_q = self.q_adaptive_layernorm(x_q, single_cond_q)
         x_k = self.k_adaptive_layernorm(x_k, single_cond_k)
 
+        # q from x_q, k/v from x_k. Fuse k/v projections into a single GEMM.
         q = self.q_projection(x_q)
-        k = self.k_projection(x_k)
+
+        # x_k last dim should match both key_dim and value_dim in practice.
+        w_k = self.k_projection.weight  # [key_dim, key_dim]
+        w_v = self.v_projection.weight  # [value_dim, value_dim]
+        if self.key_dim == self.value_dim:
+            w_kv = torch.cat([w_k, w_v], dim=0)  # [2C, C]
+            kv = torch.matmul(x_k, w_kv.transpose(0, 1))  # [..., 2C]
+            k, v = kv.split(self.key_dim, dim=-1)
+        else:
+            k = self.k_projection(x_k)
+            v = self.v_projection(x_k)
+
         q = torch.reshape(q, q.shape[:-1] +
                           (self.num_head, self.key_dim_per_head))
         k = torch.reshape(k, k.shape[:-1] +
@@ -329,7 +353,6 @@ class CrossAttention(nn.Module):
             logits += pair_logits
         weights = torch.softmax(logits, axis=-1)
 
-        v = self.v_projection(x_k)
         v = torch.reshape(v, v.shape[:-1] +
                           (self.num_head, self.value_dim_per_head))
         weighted_avg = torch.einsum('...hqk,...khc->...qhc', weights, v)
