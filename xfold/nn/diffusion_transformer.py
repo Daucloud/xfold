@@ -10,7 +10,7 @@
 # https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,15 +47,19 @@ class AdaptiveLayerNorm(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+                single_cond: Optional[torch.Tensor] = None,
+                precomputed_cond: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
 
-        assert (single_cond is None) == (self.use_single_cond is False)
+        assert (single_cond is None and precomputed_cond is None) == (self.use_single_cond is False)
 
         if self.use_single_cond is True:
             x = self.layer_norm(x)
-            single_cond = self.single_cond_layer_norm(single_cond)
-            single_scale = self.single_cond_scale(single_cond)
-            single_bias = self.single_cond_bias(single_cond)
+            if precomputed_cond is not None:
+                single_scale, single_bias = precomputed_cond
+            else:
+                single_cond = self.single_cond_layer_norm(single_cond)
+                single_scale = self.single_cond_scale(single_cond)
+                single_bias = self.single_cond_bias(single_cond)
             return torch.sigmoid(single_scale) * x + single_bias
         else:
             return self.layer_norm(x)
@@ -81,13 +85,17 @@ class AdaLNZero(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+                single_cond: Optional[torch.Tensor] = None,
+                precomputed_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        assert (single_cond is None) == (self.use_single_cond is False)
+        assert (single_cond is None and precomputed_cond is None) == (self.use_single_cond is False)
 
         output = self.transition2(x)
         if self.use_single_cond is True:
-            cond = self.adaptive_zero_cond(single_cond)
+            if precomputed_cond is not None:
+                cond = precomputed_cond
+            else:
+                cond = self.adaptive_zero_cond(single_cond)
             output = torch.sigmoid(cond) * output
         return output
 
@@ -117,10 +125,17 @@ class DiffusionTransition(nn.Module):
             self.use_single_cond
         )
 
-    def forward(self, x: torch.Tensor, single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.adaptive_layernorm(x, single_cond)
+    def forward(self, x: torch.Tensor, single_cond: Optional[torch.Tensor] = None,
+                precomputed_cond: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]] = None) -> torch.Tensor:
+        
+        norm_cond = None
+        zero_cond = None
+        if precomputed_cond is not None:
+            norm_cond, zero_cond = precomputed_cond
+
+        x = self.adaptive_layernorm(x, single_cond, precomputed_cond=norm_cond)
         c = fastnn.gated_linear_unit(x, self.transition1.weight.T)
-        return self.adaptive_zero_init(c, single_cond)
+        return self.adaptive_zero_init(c, single_cond, precomputed_cond=zero_cond)
 
 
 class SelfAttention(nn.Module):
@@ -155,7 +170,8 @@ class SelfAttention(nn.Module):
                 x: torch.Tensor,
                 mask: torch.Tensor,
                 pair_logits: Optional[torch.Tensor] = None,
-                single_cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+                single_cond: Optional[torch.Tensor] = None,
+                precomputed_cond: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]] = None) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): (num_tokens, ch)
@@ -163,9 +179,14 @@ class SelfAttention(nn.Module):
             pair_logits (torch.Tensor, optional): (num_heads, num_tokens, num_tokens)
         """
 
-        assert (single_cond is None) == (self.use_single_cond is False)
+        assert (single_cond is None and precomputed_cond is None) == (self.use_single_cond is False)
 
-        x = self.adaptive_layernorm(x, single_cond)
+        norm_cond = None
+        zero_cond = None
+        if precomputed_cond is not None:
+            norm_cond, zero_cond = precomputed_cond
+
+        x = self.adaptive_layernorm(x, single_cond, precomputed_cond=norm_cond)
 
         # Fuse q/k/v projections into a single GEMM on x to reduce
         # the number of large matrix multiplications.
@@ -196,7 +217,7 @@ class SelfAttention(nn.Module):
         gate_logits = self.gating_query(x)
         weighted_avg *= torch.sigmoid(gate_logits)
 
-        return self.adaptive_zero_init(weighted_avg, single_cond)
+        return self.adaptive_zero_init(weighted_avg, single_cond, precomputed_cond=zero_cond)
 
 
 class DiffusionTransformer(nn.Module):
@@ -232,6 +253,10 @@ class DiffusionTransformer(nn.Module):
         self._pair_logits_cache_key = None
         self._pair_logits_cache = None
 
+        # Cache for single_cond to avoid recomputation
+        self._single_cond_cache_key = None
+        self._single_cond_cache = None
+
     def _compute_pair_logits(self, pair_cond: torch.Tensor) -> list[torch.Tensor]:
         """Compute (or reuse cached) pair_logits for all super blocks.
 
@@ -257,21 +282,55 @@ class DiffusionTransformer(nn.Module):
         self._pair_logits_cache = pair_logits_all
         return pair_logits_all
 
+    def _compute_single_cond_cache(self, single_cond: torch.Tensor) -> list[Tuple]:
+        """Compute (or reuse cached) single_cond projections for all blocks."""
+        cache_key = id(single_cond)
+        if cache_key == self._single_cond_cache_key and self._single_cond_cache is not None:
+            return self._single_cond_cache
+
+        cache = []
+        for i in range(self.num_blocks):
+            # Self Attention
+            sa = self.self_attention[i]
+            # Adaptive LayerNorm
+            sc = sa.adaptive_layernorm.single_cond_layer_norm(single_cond)
+            sa_norm = (sa.adaptive_layernorm.single_cond_scale(sc),
+                       sa.adaptive_layernorm.single_cond_bias(sc))
+            # AdaLNZero
+            sa_zero = sa.adaptive_zero_init.adaptive_zero_cond(single_cond)
+            
+            # Transition
+            tr = self.transition_block[i]
+            # Adaptive LayerNorm
+            sc = tr.adaptive_layernorm.single_cond_layer_norm(single_cond)
+            tr_norm = (tr.adaptive_layernorm.single_cond_scale(sc),
+                       tr.adaptive_layernorm.single_cond_bias(sc))
+            # AdaLNZero
+            tr_zero = tr.adaptive_zero_init.adaptive_zero_cond(single_cond)
+            
+            cache.append(((sa_norm, sa_zero), (tr_norm, tr_zero)))
+
+        self._single_cond_cache_key = cache_key
+        self._single_cond_cache = cache
+        return cache
+
     def forward(self,
                 act: torch.Tensor,
                 mask: torch.Tensor,
                 single_cond: torch.Tensor,
                 pair_cond:  torch.Tensor):
 
-        pair_logits_all = self._compute_pair_logits(pair_cond)
+        single_cond_cache = self._compute_single_cond_cache(single_cond)
 
         for super_block_i in range(self.num_super_blocks):
             pair_logits = pair_logits_all[super_block_i]
             for j in range(self.super_block_size):
-                act += self.self_attention[super_block_i * self.super_block_size + j](
-                    act, mask, pair_logits[j, ...], single_cond)
-                act += self.transition_block[super_block_i *
-                                             self.super_block_size + j](act, single_cond)
+                block_idx = super_block_i * self.super_block_size + j
+                sa_cond, tr_cond = single_cond_cache[block_idx]
+
+                act += self.self_attention[block_idx](
+                    act, mask, pair_logits[j, ...], single_cond, precomputed_cond=sa_cond)
+                act += self.transition_block[block_idx](act, single_cond, precomputed_cond=tr_cond)
 
         return act
 
@@ -312,7 +371,12 @@ class CrossAttention(nn.Module):
         mask_k: torch.Tensor,
         pair_logits: Optional[torch.Tensor] = None,
         single_cond_q: Optional[torch.Tensor] = None,
-        single_cond_k: Optional[torch.Tensor] = None
+        single_cond_k: Optional[torch.Tensor] = None,
+        precomputed_cond: Optional[Tuple[
+            Tuple[torch.Tensor, torch.Tensor], # q_norm
+            Tuple[torch.Tensor, torch.Tensor], # k_norm
+            torch.Tensor # zero_init
+        ]] = None
     ) -> torch.Tensor:
         assert len(mask_q.shape) == len(x_q.shape) - \
             1, f'{mask_q.shape}, {x_q.shape}'
@@ -325,8 +389,14 @@ class CrossAttention(nn.Module):
             * mask_k.logical_not()[..., None, None, :]
         )
 
-        x_q = self.q_adaptive_layernorm(x_q, single_cond_q)
-        x_k = self.k_adaptive_layernorm(x_k, single_cond_k)
+        q_norm_cond = None
+        k_norm_cond = None
+        zero_cond = None
+        if precomputed_cond is not None:
+            q_norm_cond, k_norm_cond, zero_cond = precomputed_cond
+
+        x_q = self.q_adaptive_layernorm(x_q, single_cond_q, precomputed_cond=q_norm_cond)
+        x_k = self.k_adaptive_layernorm(x_k, single_cond_k, precomputed_cond=k_norm_cond)
 
         # q from x_q, k/v from x_k. Fuse k/v projections into a single GEMM.
         q = self.q_projection(x_q)
@@ -346,23 +416,37 @@ class CrossAttention(nn.Module):
                           (self.num_head, self.key_dim_per_head))
         k = torch.reshape(k, k.shape[:-1] +
                           (self.num_head, self.key_dim_per_head))
-
-        logits = torch.einsum('...qhc,...khc->...hqk',
-                              q * self.q_scale, k) + bias
-        if pair_logits is not None:
-            logits += pair_logits
-        weights = torch.softmax(logits, axis=-1)
-
         v = torch.reshape(v, v.shape[:-1] +
                           (self.num_head, self.value_dim_per_head))
-        weighted_avg = torch.einsum('...hqk,...khc->...qhc', weights, v)
+
+        # Use SDPA
+        # q, k, v shape: (..., num_head, dim)
+        # SDPA expects: (batch, num_head, seq_len, dim)
+        # Here we have (batch, seq_len, num_head, dim)
+        q = q.transpose(-2, -3)
+        k = k.transpose(-2, -3)
+        v = v.transpose(-2, -3)
+
+        # bias shape: (..., 1, Nq, Nk)
+        # pair_logits shape: (..., H, Nq, Nk)
+        attn_bias = bias
+        if pair_logits is not None:
+            attn_bias = attn_bias + pair_logits
+
+        weighted_avg = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_bias
+        )
+        
+        # Output: (batch, num_head, seq_len, dim) -> (batch, seq_len, num_head, dim)
+        weighted_avg = weighted_avg.transpose(-2, -3)
+        
         weighted_avg = torch.reshape(
             weighted_avg, weighted_avg.shape[:-2] + (-1,))
 
         gate_logits = self.gating_query(x_q)
         weighted_avg *= torch.sigmoid(gate_logits)
 
-        return self.adaptive_zero_init(weighted_avg, single_cond_q)
+        return self.adaptive_zero_init(weighted_avg, single_cond_q, precomputed_cond=zero_cond)
 
 
 class DiffusionCrossAttTransformer(nn.Module):
@@ -383,8 +467,45 @@ class DiffusionCrossAttTransformer(nn.Module):
         self.cross_attention = nn.ModuleList(
             [CrossAttention(num_head=self.num_head) for _ in range(self.num_blocks)])
 
-        self.transition_block = nn.ModuleList(
             [DiffusionTransition(c_x=self.c_query, c_single_cond=self.c_single_cond, use_single_cond=True) for _ in range(self.num_blocks)])
+
+        self._single_cond_cache_key = None
+        self._single_cond_cache = None
+
+    def _compute_single_cond_cache(self, single_cond_q: torch.Tensor, single_cond_k: torch.Tensor) -> list[Tuple]:
+        cache_key = (id(single_cond_q), id(single_cond_k))
+        if cache_key == self._single_cond_cache_key and self._single_cond_cache is not None:
+            return self._single_cond_cache
+        
+        cache = []
+        for i in range(self.num_blocks):
+            # Cross Attention
+            ca = self.cross_attention[i]
+            # Q Norm
+            sc_q = ca.q_adaptive_layernorm.single_cond_layer_norm(single_cond_q)
+            q_norm = (ca.q_adaptive_layernorm.single_cond_scale(sc_q),
+                      ca.q_adaptive_layernorm.single_cond_bias(sc_q))
+            # K Norm
+            sc_k = ca.k_adaptive_layernorm.single_cond_layer_norm(single_cond_k)
+            k_norm = (ca.k_adaptive_layernorm.single_cond_scale(sc_k),
+                      ca.k_adaptive_layernorm.single_cond_bias(sc_k))
+            # Zero Init
+            zero_cond = ca.adaptive_zero_init.adaptive_zero_cond(single_cond_q)
+            
+            # Transition
+            tr = self.transition_block[i]
+            # Norm
+            sc_tr = tr.adaptive_layernorm.single_cond_layer_norm(single_cond_q)
+            tr_norm = (tr.adaptive_layernorm.single_cond_scale(sc_tr),
+                       tr.adaptive_layernorm.single_cond_bias(sc_tr))
+            # Zero
+            tr_zero = tr.adaptive_zero_init.adaptive_zero_cond(single_cond_q)
+            
+            cache.append(((q_norm, k_norm, zero_cond), (tr_norm, tr_zero)))
+            
+        self._single_cond_cache_key = cache_key
+        self._single_cond_cache = cache
+        return cache
 
     def forward(
         self,
@@ -403,10 +524,14 @@ class DiffusionCrossAttTransformer(nn.Module):
         pair_logits = einops.rearrange(
             pair_logits, 'n q k (b h) -> b n h q k', h=self.num_head)
 
+        single_cond_cache = self._compute_single_cond_cache(queries_single_cond, keys_single_cond)
+
         for block_idx in range(self.num_blocks):
             keys_act = atom_layout.convert(
                 queries_to_keys, queries_act, layout_axes=(-3, -2)
             )
+
+            ca_cond, tr_cond = single_cond_cache[block_idx]
 
             queries_act += self.cross_attention[block_idx](
                 x_q=queries_act,
@@ -416,10 +541,12 @@ class DiffusionCrossAttTransformer(nn.Module):
                 pair_logits=pair_logits[block_idx,...],
                 single_cond_q=queries_single_cond,
                 single_cond_k=keys_single_cond,
+                precomputed_cond=ca_cond
             )
             queries_act += self.transition_block[block_idx](
                 queries_act,
                 queries_single_cond,
+                precomputed_cond=tr_cond
             )
 
         return queries_act

@@ -98,7 +98,7 @@ _RUN_INFERENCE = flags.DEFINE_bool(
 
 _USE_FASTNN = flags.DEFINE_bool(
     'fastnn',
-    True,
+    False,
     'Whether to run inference with fastnn.',
 )
 
@@ -232,6 +232,14 @@ class ModelRunner:
             fastnn_config.layer_norm_implementation = 'triton'
             fastnn_config.dot_product_attention_implementation = 'triton'
             fastnn_config.gated_linear_unit_implementation = 'triton'
+        else:
+            fastnn_config.layer_norm_implementation = 'torch'
+            fastnn_config.dot_product_attention_implementation = 'torch'
+            fastnn_config.gated_linear_unit_implementation = 'torch'
+        
+        # Optimize model with torch.compile
+        print("Compiling model with torch.compile...")
+        self._model = torch.compile(self._model)
 
     @torch.inference_mode()
     def run_inference(
