@@ -216,18 +216,45 @@ class DiffusionTransformer(nn.Module):
         self.transition_block = nn.ModuleList(
             [DiffusionTransition(self.c_act, self.c_single_cond, use_single_cond=True) for _ in range(self.num_blocks)])
 
+        # Cache for pair_logits to avoid recomputation across diffusion steps
+        self._pair_logits_cache_key = None
+        self._pair_logits_cache = None
+
+    def _compute_pair_logits(self, pair_cond: torch.Tensor) -> list[torch.Tensor]:
+        """Compute (or reuse cached) pair_logits for all super blocks.
+
+        pair_cond does not depend on the diffusion noise level, so across
+        diffusion steps we can reuse the same pair_logits as long as the
+        pair_cond tensor object is the same.
+        """
+        cache_key = id(pair_cond)
+        if cache_key == self._pair_logits_cache_key and self._pair_logits_cache is not None:
+            return self._pair_logits_cache
+
+        pair_act = self.pair_input_layer_norm(pair_cond)
+
+        pair_logits_all: list[torch.Tensor] = []
+        for super_block_i in range(self.num_super_blocks):
+            pair_logits = self.pair_logits_projection[super_block_i](pair_act)
+            pair_logits = einops.rearrange(
+                pair_logits, 'n s (b h) -> b h n s', h=self.num_head
+            )
+            pair_logits_all.append(pair_logits)
+
+        self._pair_logits_cache_key = cache_key
+        self._pair_logits_cache = pair_logits_all
+        return pair_logits_all
+
     def forward(self,
                 act: torch.Tensor,
                 mask: torch.Tensor,
                 single_cond: torch.Tensor,
                 pair_cond:  torch.Tensor):
 
-        pair_act = self.pair_input_layer_norm(pair_cond)
+        pair_logits_all = self._compute_pair_logits(pair_cond)
 
         for super_block_i in range(self.num_super_blocks):
-            pair_logits = self.pair_logits_projection[super_block_i](pair_act)
-            pair_logits = einops.rearrange(
-                pair_logits, 'n s (b h) -> b h n s', h=self.num_head)
+            pair_logits = pair_logits_all[super_block_i]
             for j in range(self.super_block_size):
                 act += self.self_attention[super_block_i * self.super_block_size + j](
                     act, mask, pair_logits[j, ...], single_cond)
