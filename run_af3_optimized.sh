@@ -33,6 +33,10 @@ export OMP_PROC_BIND=CLOSE          # PyTorch Tuning Guide 推荐
 export OMP_SCHEDULE=STATIC
 export OMP_PLACES=cores
 
+# Python & PyTorch Optimizations
+export PYTHONOPTIMIZE=1              # Disable assertions
+export TORCHINDUCTOR_FREEZING=1      # Freeze constants for torch.compile
+
 # Intel OpenMP 运行时推荐设置（若实际使用 libiomp）
 export KMP_BLOCKTIME="${KMP_BLOCKTIME:-1}"
 export KMP_AFFINITY="${KMP_AFFINITY:-granularity=fine,compact,1,0}"
@@ -54,10 +58,23 @@ export DNNL_MAX_CPU_ISA=AVX512_CORE
 if [ -r /usr/lib/x86_64-linux-gnu/libiomp5.so ]; then
   export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libiomp5.so${LD_PRELOAD:+:${LD_PRELOAD}}"
 fi
-if [ -r /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 ]; then
-  export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4${LD_PRELOAD:+:${LD_PRELOAD}}"
-elif [ -r /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ]; then
-  export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+# Check Conda environment for jemalloc/tcmalloc first
+if [ -n "$CONDA_PREFIX" ]; then
+  if [ -r "$CONDA_PREFIX/lib/libjemalloc.so" ]; then
+    export LD_PRELOAD="$CONDA_PREFIX/lib/libjemalloc.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+  elif [ -r "$CONDA_PREFIX/lib/libtcmalloc.so" ]; then
+    export LD_PRELOAD="$CONDA_PREFIX/lib/libtcmalloc.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+  fi
+fi
+
+# Fallback to system paths if not found in Conda
+if [[ "$LD_PRELOAD" != *"jemalloc"* && "$LD_PRELOAD" != *"tcmalloc"* ]]; then
+  if [ -r /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 ]; then
+    export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4${LD_PRELOAD:+:${LD_PRELOAD}}"
+  elif [ -r /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ]; then
+    export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:${LD_PRELOAD}}"
+  fi
 fi
 
 echo "[ENV] Start time: $(date '+%F %T')"
