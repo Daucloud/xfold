@@ -37,18 +37,25 @@ class GridSelfAttention(nn.Module):
             self.c_pair, self.c_pair, bias=False)
 
     def _attention(self, pair: torch.Tensor, mask: torch.Tensor, bias: torch.Tensor):
-        q = self.q_projection(pair)
-        k = self.k_projection(pair)
-        v = self.v_projection(pair)
+        b, n, c = pair.shape
 
-        q, k, v = map(lambda t: einops.rearrange(
-            t, 'b n (h d) -> b h n d', h=self.num_head), [q, k, v])
+        w_q = self.q_projection.weight
+        w_k = self.k_projection.weight
+        w_v = self.v_projection.weight
+        w_qkv = torch.cat([w_q, w_k, w_v], dim=0)
+
+        qkv = torch.matmul(pair, w_qkv.transpose(0, 1))
+        q, k, v = qkv.split(c, dim=-1)
+
+        q = q.view(b, n, self.num_head, self.qkv_dim).permute(0, 2, 1, 3).contiguous()
+        k = k.view(b, n, self.num_head, self.qkv_dim).permute(0, 2, 1, 3).contiguous()
+        v = v.view(b, n, self.num_head, self.qkv_dim).permute(0, 2, 1, 3).contiguous()
 
         weighted_avg = fastnn.dot_product_attention(q, k, v,
                                                     mask=mask,
                                                     bias=bias)
 
-        weighted_avg = einops.rearrange(weighted_avg, 'b h n d -> b n (h d)')
+        weighted_avg = weighted_avg.permute(0, 2, 1, 3).contiguous().view(b, n, c)
 
         gate_values = self.gating_query(pair)
 
