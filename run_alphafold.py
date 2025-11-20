@@ -227,7 +227,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_inference(
-        self, featurised_example: features.BatchDict
+        self, featurised_example: features.BatchDict, enable_profiler: bool = False
     ) -> base_model.ModelResult:
         """Computes a forward pass of the model on a featurised example."""
         featurised_example = pytree.tree_map(
@@ -246,8 +246,31 @@ class ModelRunner:
         #     result = self._model(featurised_example)
         #     result['__identifier__'] = self._model.__identifier__.numpy()
 
-        result = self._model(featurised_example)
-        result['__identifier__'] = self._model.__identifier__.numpy()
+        if enable_profiler:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True,
+            ) as prof:
+                result = self._model(featurised_example)
+                result['__identifier__'] = self._model.__identifier__.numpy()
+            
+            # Save profiler results
+            prof.export_chrome_trace("profiler_trace.json")
+            print("\n" + "="*80)
+            print("PROFILER RESULTS - Top 20 CPU time operations:")
+            print("="*80)
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+            print("\n" + "="*80)
+            print("PROFILER RESULTS - Top 20 memory operations:")
+            print("="*80)
+            print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=20))
+            print("="*80 + "\n")
+        else:
+            result = self._model(featurised_example)
+            result['__identifier__'] = self._model.__identifier__.numpy()
 
         result = pytree.tree_map_only(
             torch.Tensor,
@@ -320,7 +343,9 @@ def predict_structure(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        result = model_runner.run_inference(example)
+        # Enable profiler only for the first seed
+        enable_profiler = (seed == fold_input.rng_seeds[0])
+        result = model_runner.run_inference(example, enable_profiler=enable_profiler)
         # torch.cuda.synchronize()
         print(
             f'Running model inference for seed {seed} took '
