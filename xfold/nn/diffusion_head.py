@@ -141,16 +141,43 @@ class DiffusionHead(nn.Module):
 
         self.fourier_embeddings = FourierEmbeddings(dim=256)
 
-    def _conditioning(
+        # Cache for conditioning terms that do not depend on noise level.
+        # This allows reuse across diffusion steps for the same (batch, embeddings).
+        self._conditioning_cache_key = None
+        self._conditioning_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def clear_conditioning_cache(self) -> None:
+        """Clear cached conditioning (to be called when batch/embeddings change)."""
+        self._conditioning_cache_key = None
+        self._conditioning_cache = None
+
+    def _compute_static_conditioning(
         self,
         batch,
         embeddings: dict[str, torch.Tensor],
-        noise_level: torch.Tensor,
         use_conditioning: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute parts of conditioning independent of noise_level.
+
+        Returns:
+          single_cond_base: base single conditioning (before adding noise embedding).
+          pair_cond: pairwise conditioning.
+        """
+        # Build a lightweight cache key based on object identity.
+        key = (
+            id(batch),
+            id(embeddings.get('single')),
+            id(embeddings.get('pair')),
+            id(embeddings.get('target_feat')),
+            bool(use_conditioning),
+        )
+        if key == self._conditioning_cache_key and self._conditioning_cache is not None:
+            return self._conditioning_cache
+
         single_embedding = use_conditioning * embeddings['single']
         pair_embedding = use_conditioning * embeddings['pair']
 
+        # Relative features only depend on batch.token_features and dtype of pair_embedding.
         rel_features = featurization.create_relative_encoding(
             batch.token_features, max_relative_idx=32, max_relative_chain=2
         ).to(dtype=pair_embedding.dtype)
@@ -159,21 +186,37 @@ class DiffusionHead(nn.Module):
         pair_cond = self.pair_cond_initial_projection(
             self.pair_cond_initial_norm(features_2d)
         )
-
-        pair_cond += self.pair_transition_0(pair_cond)
-        pair_cond += self.pair_transition_1(pair_cond)
+        pair_cond = pair_cond + self.pair_transition_0(pair_cond)
+        pair_cond = pair_cond + self.pair_transition_1(pair_cond)
 
         target_feat = embeddings['target_feat']
-        features_1d = torch.concatenate(
-            [single_embedding, target_feat], dim=-1)
-        single_cond = self.single_cond_initial_projection(
-            self.single_cond_initial_norm(features_1d))
+        features_1d = torch.concatenate([single_embedding, target_feat], dim=-1)
+        single_cond_base = self.single_cond_initial_projection(
+            self.single_cond_initial_norm(features_1d)
+        )
+
+        self._conditioning_cache_key = key
+        self._conditioning_cache = (single_cond_base, pair_cond)
+        return single_cond_base, pair_cond
+
+    def _conditioning(
+        self,
+        batch,
+        embeddings: dict[str, torch.Tensor],
+        noise_level: torch.Tensor,
+        use_conditioning: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        single_cond_base, pair_cond = self._compute_static_conditioning(
+            batch=batch,
+            embeddings=embeddings,
+            use_conditioning=use_conditioning,
+        )
 
         noise_embedding = self.fourier_embeddings(
             (1 / 4) * torch.log(noise_level / SIGMA_DATA)
         )
 
-        single_cond += self.noise_embedding_initial_projection(
+        single_cond = single_cond_base + self.noise_embedding_initial_projection(
             self.noise_embedding_initial_norm(noise_embedding)
         )
 

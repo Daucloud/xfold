@@ -337,6 +337,10 @@ class AlphaFold3(nn.Module):
 
         device = mask.device
 
+        # Clear any cached conditioning from previous calls.
+        if hasattr(self.diffusion_head, "clear_conditioning_cache"):
+            self.diffusion_head.clear_conditioning_cache()
+
         noise_levels = diffusion_head.noise_schedule(
             torch.linspace(0, 1, self.diffusion_steps + 1, device=device))
 
