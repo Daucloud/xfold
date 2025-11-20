@@ -12,8 +12,8 @@
 #SBATCH -N 1                       # 使用节点数
 #SBATCH --ntasks=1                 # 单进程
 #SBATCH --cpus-per-task=28         # 仅用单插槽 28 物理核，减小跨 NUMA 开销
-#SBATCH -o stdout.%j               # 标准输出
-#SBATCH -e stderr.%j               # 错误输出
+#SBATCH -o logs/stdout.%j               # 标准输出
+#SBATCH -e logs/stderr.%j               # 错误输出
 
 ########################################
 # 1. 环境加载
@@ -107,7 +107,8 @@ mkdir -p "${OUTPUT_ROOT}"
 ########################################
 
 shopt -s nullglob
-JSON_FILES=("${INPUT_DIR}"/*.json)
+# JSON_FILES=("${INPUT_DIR}"/*.json)
+JSON_FILES=("${INPUT_DIR}"/37aa_2JO9.json)
 shopt -u nullglob
 
 if [ "${#JSON_FILES[@]}" -eq 0 ]; then
