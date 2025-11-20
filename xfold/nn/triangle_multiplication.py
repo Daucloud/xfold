@@ -29,6 +29,7 @@ class TriangleMultiplication(nn.Module):
             self.c_pair, self.c_pair, bias=False)
         self.gating_linear = nn.Linear(self.c_pair, self.c_pair, bias=False)
 
+        self.outgoing = _outgoing
         self.equation='ckj,cki->cij'
         if _outgoing is True:
             self.equation='cik,cjk->cij'
@@ -58,7 +59,20 @@ class TriangleMultiplication(nn.Module):
 
         a, b = torch.chunk(projection, 2, dim=1)
         a, b = torch.squeeze(a, dim=1), torch.squeeze(b, dim=1)
-        pair = torch.einsum(self.equation, a, b)
+        
+        # Optimized matmul implementation
+        # a, b shape: [c_pair, N, N]
+        if self.outgoing:
+            # cik,cjk->cij
+            # a: [c, i, k], b: [c, j, k] -> b.T: [c, k, j]
+            # a @ b.T -> [c, i, j]
+            pair = torch.matmul(a, b.transpose(-1, -2))
+        else:
+            # ckj,cki->cij
+            # a: [c, k, j], b: [c, k, i]
+            # b.T: [c, i, k]
+            # b.T @ a -> [c, i, j]
+            pair = torch.matmul(b.transpose(-1, -2), a)
 
         pair = pair.permute(1, 2, 0)
         pair = self.center_norm(pair)

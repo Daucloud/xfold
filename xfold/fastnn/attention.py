@@ -193,23 +193,36 @@ def dot_product_attention_torch(q: torch.Tensor,
                                 v: torch.Tensor,
                                 mask: Optional[torch.Tensor] = None,
                                 bias: Optional[torch.Tensor] = None):
-    scaling = q.size(-1) ** -0.5
-    q = q * scaling
-    logits = torch.matmul(q, k.transpose(-1, -2))
-
-    if bias is not None:
-        logits += bias
-
+    # q, k, v: [batch, heads, seq_len, head_dim]
+    
+    # Handle bias if present (SDPA supports attn_mask which is additive if float)
+    attn_mask = bias
+    
     if mask is not None:
+        # Convert boolean mask to additive mask for SDPA
+        # mask: [batch, 1, 1, seq_len] or similar
         if mask.dim() == 1:
-            mask = mask[None, None, None, :].to(dtype=torch.bool)
+            mask_expanded = mask[None, None, None, :].expand(q.shape[0], 1, q.shape[2], mask.shape[0])
         elif mask.dim() == 2:
-            mask = mask[:, None, None, :].to(dtype=torch.bool)
-        logits.masked_fill_(~mask, -1e9)
+            mask_expanded = mask[:, None, None, :].expand(q.shape[0], 1, q.shape[2], mask.shape[1])
+        else:
+            mask_expanded = mask
+            
+        # If we already have a bias, add the mask penalty to it
+        # If not, create the mask penalty
+        mask_penalty = torch.zeros_like(mask_expanded, dtype=q.dtype)
+        mask_penalty.masked_fill_(~mask_expanded.to(torch.bool), -float('inf'))
+        
+        if attn_mask is None:
+            attn_mask = mask_penalty
+        else:
+            attn_mask = attn_mask + mask_penalty
 
-    weights = torch.softmax(logits, dim=-1)
-
-    return torch.matmul(weights, v)
+    # Use PyTorch's optimized SDPA
+    # It automatically selects the best kernel (FlashAttention, etc. if available, or efficient C++ impl on CPU)
+    return torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+    )
 
 
 def dot_product_attention(q: torch.Tensor,
