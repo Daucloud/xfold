@@ -101,6 +101,12 @@ _USE_FASTNN = flags.DEFINE_bool(
     'Whether to run inference with fastnn.',
 )
 
+_PROFILE = flags.DEFINE_bool(
+    'profile',
+    False,
+    'Whether to enable PyTorch Profiler for the first seed.',
+)
+
 # Binary paths.
 _JACKHMMER_BINARY_PATH = flags.DEFINE_string(
     'jackhmmer_binary_path',
@@ -247,26 +253,28 @@ class ModelRunner:
         #     result['__identifier__'] = self._model.__identifier__.numpy()
 
         if enable_profiler:
+            # Use a timestamp for the log directory to avoid overwriting
+            import datetime
+            log_dir = f"./logs/profile_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            
+            print(f"Profiling enabled. TensorBoard logs will be saved to {log_dir}")
+            
+            # Lightweight profiling configuration to avoid OOM
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-                with_flops=True,
+                record_shapes=True,  # Keep shapes to identify tensor sizes
+                profile_memory=False, # Disable memory profiling to save RAM
+                with_stack=False,     # Disable stack tracing to save RAM
+                with_flops=False,     # Disable FLOPs calculation
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir)
             ) as prof:
                 result = self._model(featurised_example)
                 result['__identifier__'] = self._model.__identifier__.numpy()
             
-            # Save profiler results
-            prof.export_chrome_trace("profiler_trace.json")
             print("\n" + "="*80)
             print("PROFILER RESULTS - Top 20 CPU time operations:")
             print("="*80)
             print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
-            print("\n" + "="*80)
-            print("PROFILER RESULTS - Top 20 memory operations:")
-            print("="*80)
-            print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=20))
             print("="*80 + "\n")
         else:
             result = self._model(featurised_example)
@@ -318,6 +326,7 @@ def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
+    enable_profile: bool = False,
 ) -> Sequence[ResultsForSeed]:
     """Runs the full inference pipeline to predict structures for each seed."""
 
@@ -343,8 +352,8 @@ def predict_structure(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-        # Enable profiler only for the first seed
-        enable_profiler = (seed == fold_input.rng_seeds[0])
+        # Enable profiler only for the first seed if requested
+        enable_profiler = enable_profile and (seed == fold_input.rng_seeds[0])
         result = model_runner.run_inference(example, enable_profiler=enable_profiler)
         # torch.cuda.synchronize()
         print(
@@ -446,6 +455,7 @@ def process_fold_input(
     model_runner: None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    enable_profile: bool = False,
 ) -> folding_input.Input:
     ...
 
@@ -467,6 +477,7 @@ def process_fold_input(
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    enable_profile: bool = False,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
     """Runs data pipeline and/or inference on a single fold input.
 
@@ -515,6 +526,7 @@ def process_fold_input(
             fold_input=fold_input,
             model_runner=model_runner,
             buckets=buckets,
+            enable_profile=enable_profile,
         )
         print(
             f'Writing outputs for {fold_input.name} for seed(s)'
@@ -629,6 +641,7 @@ def main(_):
             model_runner=model_runner,
             output_dir=os.path.join(
                 _OUTPUT_DIR.value, fold_input.sanitised_name()),
+            enable_profile=_PROFILE.value,
         )
 
     # print(f'Done processing {len(fold_inputs)} fold inputs.')
