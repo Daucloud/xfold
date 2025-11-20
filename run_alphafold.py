@@ -49,6 +49,7 @@ from alphafold3.model.diffusion.model import Diffuser
 import numpy as np
 import torch
 import torch.utils._pytree as pytree
+from torch.profiler import profile as torch_profile, ProfilerActivity, tensorboard_trace_handler
 
 from xfold.alphafold3 import AlphaFold3
 from xfold.params import import_jax_weights_
@@ -199,6 +200,13 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'num_diffusion_samples',
     5,
     'Number of diffusion samples to generate.',
+)
+
+_PROFILE = flags.DEFINE_bool(
+    'profile',
+    False,
+    'Enable torch.profiler for a single fold input and write TensorBoard '
+    'traces under ./prof_logs.',
 )
 
 
@@ -596,15 +604,51 @@ def main(_):
         print('Skipping running model inference.')
         model_runner = None
 
-    # print(f'Processing {len(fold_inputs)} fold inputs.')
-    for fold_input in fold_inputs:
-        process_fold_input(
-            fold_input=fold_input,
-            data_pipeline_config=data_pipeline_config,
-            model_runner=model_runner,
-            output_dir=os.path.join(
-                _OUTPUT_DIR.value, fold_input.sanitised_name()),
-        )
+    # When profiling, only run the first fold input inside torch.profiler
+    # to keep traces manageable.
+    if _PROFILE.value and _RUN_INFERENCE.value:
+        if not fold_inputs:
+            print('No fold inputs to profile.')
+        else:
+            fold_input = fold_inputs[0]
+            print(f'[PROFILE] Profiling fold input: {fold_input.name}')
+            with torch_profile(
+                activities=[ProfilerActivity.CPU],
+                record_shapes=True,
+                profile_memory=True,
+                on_trace_ready=tensorboard_trace_handler("./prof_logs"),
+                with_stack=False,
+            ) as prof:
+                process_fold_input(
+                    fold_input=fold_input,
+                    data_pipeline_config=data_pipeline_config,
+                    model_runner=model_runner,
+                    output_dir=os.path.join(
+                        _OUTPUT_DIR.value, fold_input.sanitised_name()),
+                )
+                # Single step is enough since we only wrap one call.
+                prof.step()
+            print('[PROFILE] Trace written to ./prof_logs (use TensorBoard to inspect).')
+
+        # Optionally process remaining fold inputs without profiling.
+        for fold_input in fold_inputs[1:]:
+            process_fold_input(
+                fold_input=fold_input,
+                data_pipeline_config=data_pipeline_config,
+                model_runner=model_runner,
+                output_dir=os.path.join(
+                    _OUTPUT_DIR.value, fold_input.sanitised_name()),
+            )
+    else:
+        # Regular path: process all fold inputs without profiling.
+        for fold_input in fold_inputs:
+            process_fold_input(
+                fold_input=fold_input,
+                data_pipeline_config=data_pipeline_config,
+                model_runner=model_runner,
+                output_dir=os.path.join(
+                    _OUTPUT_DIR.value, fold_input.sanitised_name()),
+            )
 
     # print(f'Done processing {len(fold_inputs)} fold inputs.')
 
