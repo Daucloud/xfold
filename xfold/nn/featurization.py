@@ -130,6 +130,15 @@ def create_relative_encoding(
     max_relative_chain: int
 ) -> torch.Tensor:
     """Add relative position encodings."""
+    # Cache relative encodings on the TokenFeatures object so that they can be
+    # reused across multiple calls (e.g. Evoformer recycles and diffusion
+    # steps) within the same prediction. This avoids recomputing large
+    # num_res x num_res one-hot tensors many times.
+    cache_attr = f"_relative_encoding_{max_relative_idx}_{max_relative_chain}"
+    cached = getattr(seq_features, cache_attr, None)
+    if cached is not None:
+        return cached
+
     rel_feats = []
     token_index = seq_features.token_index
     residue_index = seq_features.residue_index
@@ -207,7 +216,18 @@ def create_relative_encoding(
 
     rel_feats.append(rel_chain)
 
-    return torch.concatenate(rel_feats, dim=-1)
+    rel_encoding = torch.concatenate(rel_feats, dim=-1)
+
+    # TokenFeatures is a frozen dataclass; use object.__setattr__ to attach
+    # the cache without mutating existing fields.
+    try:
+        object.__setattr__(seq_features, cache_attr, rel_encoding)
+    except Exception:
+        # If for some reason we cannot cache (e.g. unexpected type), just
+        # return the computed encoding.
+        pass
+
+    return rel_encoding
 
 
 def shuffle_msa(

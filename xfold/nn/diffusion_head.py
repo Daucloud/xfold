@@ -148,26 +148,58 @@ class DiffusionHead(nn.Module):
         noise_level: torch.Tensor,
         use_conditioning: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        single_embedding = use_conditioning * embeddings['single']
-        pair_embedding = use_conditioning * embeddings['pair']
+        # The bulk of the conditioning (pair_cond and the part of single_cond
+        # that does not depend on noise_level) is constant across diffusion
+        # steps and samples for a given batch/embeddings. We cache these
+        # tensors on the batch object to avoid recomputing them thousands of
+        # times during sampling.
+        cache_key = "_diffusion_conditioning_cache"
+        cache = getattr(batch, cache_key, None) if use_conditioning else None
 
-        rel_features = featurization.create_relative_encoding(
-            batch.token_features, max_relative_idx=32, max_relative_chain=2
-        ).to(dtype=pair_embedding.dtype)
-        features_2d = torch.concatenate([pair_embedding, rel_features], dim=-1)
+        if cache is not None:
+            pair_cond = cache["pair_cond"]
+            single_base = cache["single_base"]
+        else:
+            single_embedding = use_conditioning * embeddings['single']
+            pair_embedding = use_conditioning * embeddings['pair']
 
-        pair_cond = self.pair_cond_initial_projection(
-            self.pair_cond_initial_norm(features_2d)
-        )
+            rel_features = featurization.create_relative_encoding(
+                batch.token_features, max_relative_idx=32, max_relative_chain=2
+            ).to(dtype=pair_embedding.dtype)
+            features_2d = torch.concatenate(
+                [pair_embedding, rel_features], dim=-1)
 
-        pair_cond += self.pair_transition_0(pair_cond)
-        pair_cond += self.pair_transition_1(pair_cond)
+            pair_cond = self.pair_cond_initial_projection(
+                self.pair_cond_initial_norm(features_2d)
+            )
 
-        target_feat = embeddings['target_feat']
-        features_1d = torch.concatenate(
-            [single_embedding, target_feat], dim=-1)
-        single_cond = self.single_cond_initial_projection(
-            self.single_cond_initial_norm(features_1d))
+            pair_cond += self.pair_transition_0(pair_cond)
+            pair_cond += self.pair_transition_1(pair_cond)
+
+            target_feat = embeddings['target_feat']
+            features_1d = torch.concatenate(
+                [single_embedding, target_feat], dim=-1)
+            single_base = self.single_cond_initial_projection(
+                self.single_cond_initial_norm(features_1d))
+
+            if use_conditioning:
+                try:
+                    object.__setattr__(
+                        batch,
+                        cache_key,
+                        {
+                            "pair_cond": pair_cond,
+                            "single_base": single_base,
+                        },
+                    )
+                except Exception:
+                    # If caching fails for any reason, we still return the
+                    # freshly computed tensors.
+                    pass
+
+        # Work on a clone so that cached single_base remains unchanged across
+        # diffusion steps.
+        single_cond = single_base.clone()
 
         noise_embedding = self.fourier_embeddings(
             (1 / 4) * torch.log(noise_level / SIGMA_DATA)

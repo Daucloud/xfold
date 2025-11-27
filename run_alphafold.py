@@ -213,6 +213,27 @@ class ModelRunner:
         self._model_dir = model_dir
         self._device = device
 
+        # Tune PyTorch CPU threading according to environment variables.
+        # This mirrors recommendations from the PyTorch Tuning Guide and
+        # avoids oversubscription when used together with OpenMP.
+        try:
+            torch_intra = int(
+                os.environ.get(
+                    "TORCH_NUM_THREADS",
+                    os.environ.get("OMP_NUM_THREADS", "0"),
+                )
+            )
+        except ValueError:
+            torch_intra = 0
+        if torch_intra > 0:
+            torch.set_num_threads(torch_intra)
+
+        try:
+            torch_inter = int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1"))
+        except ValueError:
+            torch_inter = 1
+        torch.set_num_interop_threads(max(torch_inter, 1))
+
         self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
         self._model.eval()
         print('loading the model parameters...')

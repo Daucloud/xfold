@@ -11,7 +11,9 @@
 #SBATCH -p cnmix                   # 使用队列
 #SBATCH -N 1                       # 使用节点数
 #SBATCH --ntasks=1                 # 单进程
-#SBATCH --cpus-per-task=28         # 仅用单插槽 28 物理核，减小跨 NUMA 开销
+#SBATCH --cpus-per-task=56         # 默认：用满单节点 56 核追求单样本时间
+## 如需只用半个插槽，可改为：
+## #SBATCH --cpus-per-task=28
 #SBATCH -o stdout.%j               # 标准输出
 #SBATCH -e stderr.%j               # 错误输出
 
@@ -22,16 +24,16 @@ source ~/.bashrc
 conda activate af3                  # 替换为你的环境名
 
 ########################################
-# 2. 线程与亲和性（单插槽 28 物理核）
+# 2. 线程与亲和性
 ########################################
 
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-28}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-56}"
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+export TORCH_NUM_THREADS="${OMP_NUM_THREADS}"
 export OMP_DYNAMIC=FALSE
 export MKL_DYNAMIC=FALSE
 export OMP_PROC_BIND=CLOSE          # PyTorch Tuning Guide 推荐
 export OMP_SCHEDULE=STATIC
-export OMP_PLACES=cores
 
 # Intel OpenMP 运行时推荐设置（若实际使用 libiomp）
 export KMP_BLOCKTIME="${KMP_BLOCKTIME:-1}"
@@ -68,17 +70,22 @@ echo "[ENV] LD_PRELOAD=${LD_PRELOAD-}"
 # 4. NUMA 策略（仅内存策略，避免与 Slurm cpuset 冲突）
 ########################################
 
-# NUMA_MODE: auto | membind | none
-NUMA_MODE="${NUMA_MODE:-auto}"
+# NUMA_MODE: bind | membind | interleave | none
+# 默认 none：先和 baseline 对齐，不做 NUMA 绑定
+# 如要测试 NUMA，可在 sbatch 前 export NUMA_MODE=membind
+NUMA_MODE="${NUMA_MODE:-none}"
 NUMA_NODE="${NUMA_NODE:-0}"
 NUMA_PREFIX=()
 
 if command -v numactl >/dev/null 2>&1; then
   case "${NUMA_MODE}" in
+    bind)
+      NUMA_PREFIX=(numactl --membind="${NUMA_NODE}")
+      ;;
     membind)
       NUMA_PREFIX=(numactl --membind="${NUMA_NODE}")
       ;;
-    auto|interleave)
+    interleave|auto)
       NUMA_PREFIX=(numactl --interleave=all)
       ;;
     none)

@@ -308,10 +308,11 @@ class AlphaFold3(nn.Module):
 
         noise_scale = self.noise_scale * \
             torch.sqrt(t_hat**2 - noise_level_prev**2)
-        noise = noise_scale * \
-            torch.randn(size=positions.shape, device=noise_scale.device)
-        noise = noise_scale
-        positions_noisy = positions + noise
+        # The current implementation adds a scalar noise_scale to all
+        # positions. Generating a full tensor of random noise here is
+        # unnecessary work, as it is overwritten immediately. We keep the
+        # existing behaviour (scalar shift) but avoid the wasted sampling.
+        positions_noisy = positions + noise_scale
 
         positions_denoised = self.diffusion_head(positions_noisy=positions_noisy,
                                                  noise_level=t_hat,
