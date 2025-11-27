@@ -378,6 +378,11 @@ class AlphaFold3(nn.Module):
         noise_levels = diffusion_head.noise_schedule(
             torch.linspace(0, 1, self.diffusion_steps + 1, device=device))
 
+        # Clear any cached conditioning in the diffusion head so that
+        # pair-wise conditioning is computed once per AlphaFold3 forward
+        # (and then reused across all diffusion steps and samples).
+        self.diffusion_head.clear_cache()
+
         positions = torch.randn(
             (num_samples,) + mask.shape + (3,), device=device)
         positions *= noise_levels[0]

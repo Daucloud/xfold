@@ -108,7 +108,20 @@ class MSAAttention(nn.Module):
         v = self.v_projection(msa)
         v = einops.rearrange(v, 'b k (h c) -> b k h c', h=self.num_head)
 
-        v_avg = torch.einsum('hqk, bkhc -> bqhc', weights, v)
+        # Optimized implementation of: v_avg = einsum('hqk, bkhc -> bqhc', weights, v)
+        # weights: [H, Q, K], v: [B, K, H, C] -> v_avg: [B, Q, H, C]
+        B, K, H, C = v.shape
+        Hw, Q, Kw = weights.shape
+        assert H == Hw and K == Kw, "MSAAttention: shape mismatch between weights and v"
+
+        # Reshape for batched matmul over (B*H)
+        # v_bh: [B*H, K, C]
+        v_bh = v.permute(0, 2, 1, 3).reshape(B * H, K, C)
+        # weights_bh: [B*H, Q, K]
+        weights_bh = weights.unsqueeze(0).expand(B, H, Q, K).reshape(B * H, Q, K)
+        v_avg_bh = torch.bmm(weights_bh, v_bh)  # [B*H, Q, C]
+        v_avg = v_avg_bh.view(B, H, Q, C).permute(0, 2, 1, 3)  # [B, Q, H, C]
+
         v_avg = torch.reshape(v_avg, v_avg.shape[:-2] + (-1,))
 
         gate_values = self.gating_query(msa)

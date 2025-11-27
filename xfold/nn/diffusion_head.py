@@ -141,6 +141,10 @@ class DiffusionHead(nn.Module):
 
         self.fourier_embeddings = FourierEmbeddings(dim=256)
 
+        # Cache for conditioning terms that are static across diffusion steps
+        # (per AlphaFold3 forward call, cleared explicitly from the caller).
+        self._cached_pair_cond = None
+
     def _conditioning(
         self,
         batch,
@@ -148,20 +152,32 @@ class DiffusionHead(nn.Module):
         noise_level: torch.Tensor,
         use_conditioning: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # single_embedding / target_feat may be reused across steps but depend
+        # on noise_level via noise embedding below, so we only cache the
+        # pair-wise conditioning which is independent of noise_level.
         single_embedding = use_conditioning * embeddings['single']
         pair_embedding = use_conditioning * embeddings['pair']
 
-        rel_features = featurization.create_relative_encoding(
-            batch.token_features, max_relative_idx=32, max_relative_chain=2
-        ).to(dtype=pair_embedding.dtype)
-        features_2d = torch.concatenate([pair_embedding, rel_features], dim=-1)
+        # Cache pair_cond across diffusion steps (and samples) for a given
+        # AlphaFold3 forward call. This avoids repeatedly recomputing the
+        # relatively expensive pair conditioning inside the diffusion loop.
+        if self._cached_pair_cond is None:
+            rel_features = featurization.create_relative_encoding(
+                batch.token_features, max_relative_idx=32, max_relative_chain=2
+            ).to(dtype=pair_embedding.dtype)
+            features_2d = torch.concatenate(
+                [pair_embedding, rel_features], dim=-1
+            )
 
-        pair_cond = self.pair_cond_initial_projection(
-            self.pair_cond_initial_norm(features_2d)
-        )
+            pair_cond = self.pair_cond_initial_projection(
+                self.pair_cond_initial_norm(features_2d)
+            )
 
-        pair_cond += self.pair_transition_0(pair_cond)
-        pair_cond += self.pair_transition_1(pair_cond)
+            pair_cond += self.pair_transition_0(pair_cond)
+            pair_cond += self.pair_transition_1(pair_cond)
+            self._cached_pair_cond = pair_cond
+        else:
+            pair_cond = self._cached_pair_cond
 
         target_feat = embeddings['target_feat']
         features_1d = torch.concatenate(
@@ -181,6 +197,14 @@ class DiffusionHead(nn.Module):
         single_cond += self.single_transition_1(single_cond)
 
         return single_cond, pair_cond
+
+    def clear_cache(self) -> None:
+        """Clears cached conditioning terms.
+
+        Must be called at the beginning of each new AlphaFold3 forward pass
+        (or whenever embeddings/batch change) to avoid reusing stale cache.
+        """
+        self._cached_pair_cond = None
 
     def forward(
         self,
